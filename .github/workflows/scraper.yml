@@ -20,7 +20,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests beautifulsoup4 google-cloud-firestore google-cloud-storage
+          python -m pip install --upgrade pip
+          python -m pip install requests beautifulsoup4 google-cloud-firestore google-cloud-storage playwright
           python -m playwright install --with-deps
 
       - name: Run scraper
