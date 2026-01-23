@@ -1,7 +1,8 @@
-import os, requests, datetime
+import os, requests, datetime, asyncio
 from bs4 import BeautifulSoup
 from google.cloud import firestore, storage
 from google.oauth2 import service_account
+from playwright.async_api import async_playwright
 
 # Firebase setup
 firebase_key = os.environ.get("FIREBASE_KEY")
@@ -12,7 +13,6 @@ bucket = storage_client.bucket("eco-guardian-bd74f.appspot.com")
 
 ENJOYMENT_CATEGORIES = ["party","trip","tour","concert","festival","brunch"]
 
-# Summary tracker
 scrape_summary = {}
 
 def normalize_string(s): return s.strip().lower() if s else ""
@@ -74,41 +74,36 @@ def scrape_site(url, selectors):
 
     soup = BeautifulSoup(response.text,"html.parser")
     for item in soup.select(selectors["card"]):
-        event_name = item.select_one(selectors["title"]).text.strip()
-        venue_name = item.select_one(selectors["venue"]).text.strip()
-        location = item.select_one(selectors["location"]).text.strip()
-        date_str = item.select_one(selectors["date"]).text.strip()
-        time_str = item.select_one(selectors["time"]).text.strip()
-        poster = item.select_one(selectors["poster"])["src"]
-        description = item.select_one(selectors["desc"]).text.strip() if selectors.get("desc") else ""
-
-        # Filter enjoyment events
-        if not is_enjoyment_event(event_name, description):
-            print(f"Skipped non-enjoyment event: {event_name}")
+        try:
+            event_name = item.select_one(selectors["title"]).get_text(strip=True)
+            venue_name = item.select_one(selectors["venue"]).get_text(strip=True) if selectors.get("venue") else "Unknown"
+            location = venue_name
+            date_str = item.select_one(selectors["date"]).get_text(strip=True)
+            time_str = item.select_one(selectors["time"]).get_text(strip=True) if selectors.get("time") else ""
+            poster = item.select_one(selectors["poster"])["src"] if selectors.get("poster") else ""
+            description = item.select_one(selectors["desc"]).get_text(strip=True) if selectors.get("desc") else ""
+        except Exception as e:
             skipped_events += 1
             continue
 
-        # Parse date
+        if not is_enjoyment_event(event_name, description):
+            skipped_events += 1
+            continue
+
         try: date_obj = datetime.datetime.strptime(date_str,"%d %B %Y")
         except: date_obj = datetime.datetime.utcnow()
 
-        # Filter upcoming events (next 30 days)
         if not is_upcoming_event(date_obj):
-            print(f"Skipped event outside 30-day window: {event_name}")
             skipped_events += 1
             continue
 
-        # Venue handling
         venue_id = get_or_create_venue({"name":venue_name,"location":location})
         if event_exists(event_name,date_obj,venue_id):
-            print(f"Skipped duplicate event: {event_name}")
             skipped_events += 1
             continue
 
-        # Upload poster image
-        poster_url = upload_image_to_storage(poster,event_name)
+        poster_url = upload_image_to_storage(poster,event_name) if poster else ""
 
-        # Event document
         event_doc = {
             "name": event_name,
             "date": date_obj,
@@ -124,26 +119,77 @@ def scrape_site(url, selectors):
             "isDeleted": False
         }
         db.collection("YoVibe").document("data").collection("events").add(event_doc)
-        print(f"Added event: {event_name}")
         added_events += 1
 
-    scrape_summary[url] = {
-        "added_events": added_events,
-        "skipped": skipped_events,
-        "error": None
-    }
+    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "error": None}
+
+async def scrape_quicket():
+    url = "https://www.quicket.co.ug/events/uganda"
+    added_events = 0
+    skipped_events = 0
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, timeout=60000)
+            await page.wait_for_selector("div.event-listing, div.event-card", timeout=30000)
+
+            events = await page.query_selector_all("div.event-listing, div.event-card")
+            for item in events:
+                event_name = await item.query_selector_eval("h3, .event-title", "el => el.innerText")
+                venue_name = await item.query_selector_eval(".venue, .event-venue", "el => el.innerText") if await item.query_selector(".venue, .event-venue") else "Unknown"
+                location = venue_name
+                date_str = await item.query_selector_eval(".date, .event-date", "el => el.innerText") if await item.query_selector(".date, .event-date") else ""
+                time_str = await item.query_selector_eval(".time, .event-time", "el => el.innerText") if await item.query_selector(".time, .event-time") else ""
+                description = ""
+                poster_url = ""
+
+                if not is_enjoyment_event(event_name, description):
+                    skipped_events += 1
+                    continue
+
+                try: date_obj = datetime.datetime.strptime(date_str,"%A, %B %d, %Y")
+                except: date_obj = datetime.datetime.utcnow()
+
+                if not is_upcoming_event(date_obj):
+                    skipped_events += 1
+                    continue
+
+                venue_id = get_or_create_venue({"name":venue_name,"location":location})
+                if event_exists(event_name,date_obj,venue_id):
+                    skipped_events += 1
+                    continue
+
+                event_doc = {
+                    "name": event_name,
+                    "date": date_obj,
+                    "time": time_str,
+                    "location": location,
+                    "posterImageUrl": poster_url,
+                    "artists": [],
+                    "venueId": venue_id,
+                    "venueName": venue_name,
+                    "description": description,
+                    "isFreeEntry": True,
+                    "createdAt": firestore.SERVER_TIMESTAMP,
+                    "isDeleted": False
+                }
+                db.collection("YoVibe").document("data").collection("events").add(event_doc)
+                added_events += 1
+
+            await browser.close()
+    except Exception as e:
+        scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
+        return
+
+    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "error": None}
 
 def scrape_all_sites():
     sites = [
         {"url":"https://allevents.ug/events/",
-         "selectors":{"card":".event-card","title":".event-title","venue":".event-venue",
-                      "location":".event-location","date":".event-date","time":".event-time","poster":"img"}},
+         "selectors":{"card":"div.event-list-item","title":"h3","venue":".venue","location":".venue","date":".date","time":".time","poster":"img"}},
         {"url":"https://evento.ug/events?eventtype=Music%20and%20Concerts",
-         "selectors":{"card":".event-item","title":".event-name","venue":".event-venue",
-                      "location":".event-location","date":".event-date","time":".event-time","poster":"img"}},
-        {"url":"https://www.quicket.co.ug/events/uganda",
-         "selectors":{"card":".event-card","title":".event-title","venue":".event-venue",
-                      "location":".event-location","date":".event-date","time":".event-time","poster":"img"}}
+         "selectors":{"card":"div.event-card","title":"h6 a","venue":".event-venue","location":".event-venue","date":".event-date","time":".event-time","poster":"img"}}
     ]
     for site in sites:
         scrape_site(site["url"],site["selectors"])
