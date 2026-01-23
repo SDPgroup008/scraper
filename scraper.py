@@ -56,7 +56,13 @@ def is_upcoming_event(date_obj):
     return 0 <= delta <= 30
 
 def scrape_site(url, selectors):
-    response = requests.get(url)
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Skipping {url} due to error: {e}")
+        return
+
     soup = BeautifulSoup(response.text,"html.parser")
     for item in soup.select(selectors["card"]):
         event_name = item.select_one(selectors["title"]).text.strip()
@@ -110,16 +116,18 @@ def scrape_site(url, selectors):
 
 def scrape_all_sites():
     sites = [
-        {"url":"https://alleventskampala.com/upcoming-events",
+        {"url":"https://allevents.ug/events/",
          "selectors":{"card":".event-card","title":".event-title","venue":".event-venue",
                       "location":".event-location","date":".event-date","time":".event-time","poster":"img"}},
-        {"url":"https://evento.co.ug/events",
+        {"url":"https://evento.ug/events?eventtype=Music%20and%20Concerts",
          "selectors":{"card":".event-item","title":".event-name","venue":".event-venue",
                       "location":".event-location","date":".event-date","time":".event-time","poster":"img"}},
-        {"url":"https://www.quicket.co.ug/events",
+        {"url":"https://www.quicket.co.ug/events/uganda",
          "selectors":{"card":".event-card","title":".event-title","venue":".event-venue",
                       "location":".event-location","date":".event-date","time":".event-time","poster":"img"}}
     ]
-    for site in sites: scrape_site(site["url"],site["selectors"])
+    for site in sites:
+        scrape_site(site["url"],site["selectors"])
 
-if __name__=="__main__": scrape_all_sites()
+if __name__=="__main__":
+    scrape_all_sites()
