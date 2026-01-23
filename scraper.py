@@ -12,10 +12,14 @@ bucket = storage_client.bucket("eco-guardian-bd74f.appspot.com")
 
 ENJOYMENT_CATEGORIES = ["party","trip","tour","concert","festival","brunch"]
 
+# Summary tracker
+scrape_summary = {}
+
 def normalize_string(s): return s.strip().lower() if s else ""
 
 def upload_image_to_storage(image_url, event_name):
-    response = requests.get(image_url)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    response = requests.get(image_url, headers=headers)
     blob_name = f"events/{event_name.replace(' ', '_')}/poster.jpg"
     blob = bucket.blob(blob_name)
     blob.upload_from_string(response.content, content_type="image/jpeg")
@@ -23,7 +27,7 @@ def upload_image_to_storage(image_url, event_name):
     return blob.public_url
 
 def get_or_create_venue(scraped_venue):
-    venues_ref = db.collection("venues")
+    venues_ref = db.collection("YoVibe").document("data").collection("venues")
     query = venues_ref.where("name","==",normalize_string(scraped_venue["name"])) \
                       .where("location","==",normalize_string(scraped_venue["location"])).get()
     if query: return query[0].id
@@ -40,7 +44,7 @@ def get_or_create_venue(scraped_venue):
     return venue_ref[1].id
 
 def event_exists(event_name, date, venue_id):
-    events_ref = db.collection("events")
+    events_ref = db.collection("YoVibe").document("data").collection("events")
     query = events_ref.where("name","==",normalize_string(event_name)) \
                       .where("venueId","==",venue_id) \
                       .where("date","==",date).get()
@@ -56,12 +60,17 @@ def is_upcoming_event(date_obj):
     return 0 <= delta <= 30
 
 def scrape_site(url, selectors):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
     except Exception as e:
         print(f"Skipping {url} due to error: {e}")
+        scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
         return
+
+    added_events = 0
+    skipped_events = 0
 
     soup = BeautifulSoup(response.text,"html.parser")
     for item in soup.select(selectors["card"]):
@@ -76,6 +85,7 @@ def scrape_site(url, selectors):
         # Filter enjoyment events
         if not is_enjoyment_event(event_name, description):
             print(f"Skipped non-enjoyment event: {event_name}")
+            skipped_events += 1
             continue
 
         # Parse date
@@ -85,12 +95,14 @@ def scrape_site(url, selectors):
         # Filter upcoming events (next 30 days)
         if not is_upcoming_event(date_obj):
             print(f"Skipped event outside 30-day window: {event_name}")
+            skipped_events += 1
             continue
 
         # Venue handling
         venue_id = get_or_create_venue({"name":venue_name,"location":location})
         if event_exists(event_name,date_obj,venue_id):
             print(f"Skipped duplicate event: {event_name}")
+            skipped_events += 1
             continue
 
         # Upload poster image
@@ -111,8 +123,15 @@ def scrape_site(url, selectors):
             "createdAt": firestore.SERVER_TIMESTAMP,
             "isDeleted": False
         }
-        db.collection("events").add(event_doc)
+        db.collection("YoVibe").document("data").collection("events").add(event_doc)
         print(f"Added event: {event_name}")
+        added_events += 1
+
+    scrape_summary[url] = {
+        "added_events": added_events,
+        "skipped": skipped_events,
+        "error": None
+    }
 
 def scrape_all_sites():
     sites = [
@@ -131,3 +150,10 @@ def scrape_all_sites():
 
 if __name__=="__main__":
     scrape_all_sites()
+    print("\n--- Scrape Summary ---")
+    for site, stats in scrape_summary.items():
+        print(f"Site: {site}")
+        print(f"  Added events: {stats['added_events']}")
+        print(f"  Skipped events: {stats['skipped']}")
+        if stats['error']:
+            print(f"  Error: {stats['error']}")
