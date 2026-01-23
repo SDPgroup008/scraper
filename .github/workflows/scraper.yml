@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install requests beautifulsoup4 google-cloud-firestore google-cloud-storage
-          playwright install --with-deps
+          python -m playwright install --with-deps
 
       - name: Run scraper
         env:
