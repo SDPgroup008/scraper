@@ -22,6 +22,8 @@ Thumbs.db
 
 # Firebase service account key (local only, never commit)
 serviceAccount.json
+eco-guardian-bd74f-firebase-adminsdk-thlcj-b60714ed55.json
+*firebase-adminsdk*.json
 
 # Temporary files
 *.tmp

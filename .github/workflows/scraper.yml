@@ -2,7 +2,7 @@ name: Scrape and Upload Events
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: "0 */12 * * *"   # every 12 hours
   workflow_dispatch:        # allow manual trigger
 
 jobs:
@@ -11,20 +11,32 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests beautifulsoup4 google-cloud-firestore google-cloud-storage playwright
-          python -m playwright install --with-deps
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run scraper
         env:
           FIREBASE_KEY: ${{ secrets.FIREBASE_KEY }}
         run: python scraper.py
+      
+      - name: Upload logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-logs-${{ github.run_number }}
+          path: |
+            *.log
+            **/*.log
+          retention-days: 7
