@@ -81,14 +81,37 @@ def is_upcoming_event(date_obj):
 
 def scrape_site(url, selectors):
     print(f"\n--- Starting scrape for {url} ---")
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Error fetching {url}: {e}")
-        scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
-        return
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
+    
+    # Try up to 3 times with increasing timeouts
+    max_retries = 3
+    timeout_values = [15, 30, 45]
+    
+    for attempt in range(max_retries):
+        try:
+            timeout = timeout_values[attempt]
+            print(f"Attempt {attempt + 1}/{max_retries} (timeout: {timeout}s)")
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            break  # Success, exit retry loop
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                print(f"  ⚠ Timeout, retrying...")
+                continue
+            print(f"Error fetching {url}: Connection timed out after {max_retries} attempts")
+            scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": "Connection timeout"}
+            return
+        except Exception as e:
+            print(f"Error fetching {url}: {e}")
+            scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
+            return
 
     added_events = 0
     skipped_events = 0
