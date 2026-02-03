@@ -41,7 +41,7 @@ def get_or_create_venue(scraped_venue):
                       .where("location","==",normalize_string(scraped_venue["location"])).get()
     if query:
         print(f"  ↳ Using existing venue: {scraped_venue['name']}")
-        return query[0].id
+        return query[0].id, False  # Return (venue_id, is_new)
     new_venue = {
         "name": scraped_venue["name"],
         "location": scraped_venue["location"],
@@ -60,7 +60,7 @@ def get_or_create_venue(scraped_venue):
     }
     venue_ref = venues_ref.add(new_venue)
     print(f"  ✓ Created new venue: {scraped_venue['name']} at {scraped_venue['location']}")
-    return venue_ref[1].id
+    return venue_ref[1].id, True  # Return (venue_id, is_new)
 
 def event_exists(event_name, date, venue_id):
     events_ref = db.collection("YoVibe").document("data").collection("events")
@@ -79,169 +79,201 @@ def is_upcoming_event(date_obj):
     return delta >= 0
 
 
-def scrape_site(url, selectors):
+async def scrape_site_with_playwright(url, selectors):
     print(f"\n--- Starting scrape for {url} ---")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
-    }
-    
-    # Try up to 3 times with increasing timeouts
-    max_retries = 3
-    timeout_values = [15, 30, 45]
-    
-    for attempt in range(max_retries):
-        try:
-            timeout = timeout_values[attempt]
-            print(f"Attempt {attempt + 1}/{max_retries} (timeout: {timeout}s)")
-            response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            break  # Success, exit retry loop
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                print(f"  ⚠ Timeout, retrying...")
-                continue
-            print(f"Error fetching {url}: Connection timed out after {max_retries} attempts")
-            scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": "Connection timeout"}
-            return
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
-            scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
-            return
-
     added_events = 0
     skipped_events = 0
-    soup = BeautifulSoup(response.text, "html.parser")
-    cards = soup.select(selectors["card"])
+    new_venues = 0
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            # Set user agent to avoid being blocked
+            await page.set_extra_http_headers({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            })
+            
+            print(f"Loading page...")
+            await page.goto(url, timeout=60000, wait_until="networkidle")
+            
+            # Wait for event cards to load
+            try:
+                await page.wait_for_selector(selectors["card"], timeout=30000)
+            except Exception as e:
+                print(f"  ⚠ Could not find event cards with selector '{selectors['card']}': {e}")
+                # Try to continue anyway in case some elements loaded
+            
+            # Get all event cards
+            cards = await page.query_selector_all(selectors["card"])
+            print(f"Found {len(cards)} event cards")
+            
+            if len(cards) == 0:
+                print(f"  ⚠ No events found - the page might have changed structure or requires different selectors")
+                scrape_summary[url] = {"added_events": 0, "skipped": 0, "new_venues": 0, "error": "No event cards found"}
+                await browser.close()
+                return
 
-    for idx, item in enumerate(cards, start=1):
-        try:
-            link_el = item.select_one(selectors["title"])
-            event_url = link_el["href"] if link_el and link_el.has_attr("href") else None
-            event_name = link_el.get_text(strip=True) if link_el else "Unknown"
+            for idx, item in enumerate(cards, start=1):
+                try:
+                    link_el = await item.query_selector(selectors["title"])
+                    event_url = await link_el.get_attribute("href") if link_el else None
+                    event_name = await link_el.inner_text() if link_el else "Unknown"
+                    event_name = event_name.strip()
 
-            venue_el = item.select_one(selectors["venue"])
-            venue_name = venue_el.get_text(strip=True) if venue_el else "Unknown"
-            location_el = item.select_one(selectors["location"])
-            location = location_el.get_text(strip=True) if location_el else venue_name
+                    venue_el = await item.query_selector(selectors["venue"])
+                    venue_name = await venue_el.inner_text() if venue_el else "Unknown"
+                    venue_name = venue_name.strip()
+                    
+                    location_el = await item.query_selector(selectors["location"])
+                    location = await location_el.inner_text() if location_el else venue_name
+                    location = location.strip()
 
-            # --- Date parsing ---
-            if "allevents.ug" in url:
-                # Use datetime attribute for AllEvents
-                date_el = item.select_one("time.tribe-events-calendar-list__event-datetime")
-                if date_el and date_el.has_attr("datetime"):
-                    base_date = datetime.date.fromisoformat(date_el["datetime"])
-                    time_el = item.select_one(selectors["time"])
-                    time_str = time_el.get_text(strip=True) if time_el else ""
-                    try:
-                        time_obj = datetime.datetime.strptime(time_str, "%I:%M %p").time()
-                        date_obj = datetime.datetime.combine(base_date, time_obj, tzinfo=datetime.UTC)
-                    except Exception:
-                        date_obj = datetime.datetime.combine(base_date, datetime.time(0,0), tzinfo=datetime.UTC)
-                else:
-                    print(f"Could not parse AllEvents date for {event_name}")
-                    skipped_events += 1
-                    continue
+                    # --- Date parsing ---
+                    if "allevents.ug" in url:
+                        # Use datetime attribute for AllEvents
+                        date_el = await item.query_selector("time.tribe-events-calendar-list__event-datetime")
+                        if date_el:
+                            datetime_attr = await date_el.get_attribute("datetime")
+                            if datetime_attr:
+                                base_date = datetime.date.fromisoformat(datetime_attr)
+                                time_el = await item.query_selector(selectors["time"])
+                                time_str = await time_el.inner_text() if time_el else ""
+                                time_str = time_str.strip()
+                                try:
+                                    time_obj = datetime.datetime.strptime(time_str, "%I:%M %p").time()
+                                    date_obj = datetime.datetime.combine(base_date, time_obj, tzinfo=datetime.UTC)
+                                except Exception:
+                                    date_obj = datetime.datetime.combine(base_date, datetime.time(0,0), tzinfo=datetime.UTC)
+                            else:
+                                print(f"Could not parse AllEvents date for {event_name}")
+                                skipped_events += 1
+                                continue
+                        else:
+                            print(f"Could not find date element for {event_name}")
+                            skipped_events += 1
+                            continue
 
-            elif "evento.ug" in url:
-                # Use old parsing logic for Evento
-                date_el = item.select_one(selectors["date"])
-                date_str = date_el.get_text(strip=True) if date_el else ""
-                clean_date = date_str.replace("st","").replace("nd","").replace("rd","").replace("th","").strip()
+                    elif "evento.ug" in url:
+                        # Parse Evento date format
+                        date_el = await item.query_selector(selectors["date"])
+                        date_str = await date_el.inner_text() if date_el else ""
+                        date_str = date_str.strip()
+                        clean_date = date_str.replace("st","").replace("nd","").replace("rd","").replace("th","").strip()
 
-                parsed = None
-                for fmt in ["%B %d @ %I:%M %p", "%d %b %Y %H:%M", "%d %b %Y %I:%M %p"]:
-                    try:
-                        parsed = datetime.datetime.strptime(clean_date, fmt).replace(tzinfo=datetime.UTC)
-                        break
-                    except Exception:
+                        parsed = None
+                        for fmt in ["%B %d @ %I:%M %p", "%d %b %Y %H:%M", "%d %b %Y %I:%M %p", "%B %d, %Y @ %I:%M %p"]:
+                            try:
+                                parsed = datetime.datetime.strptime(clean_date, fmt).replace(tzinfo=datetime.UTC)
+                                break
+                            except Exception:
+                                continue
+                        if not parsed:
+                            print(f"Could not parse Evento date '{date_str}' for {event_name}")
+                            skipped_events += 1
+                            continue
+                        date_obj = parsed
+
+                    else:
+                        print(f"Unknown site type for {url}")
+                        skipped_events += 1
                         continue
-                if not parsed:
-                    print(f"Could not parse Evento date for {event_name}")
+
+                    poster_el = await item.query_selector(selectors["poster"])
+                    poster = await poster_el.get_attribute("src") if poster_el else ""
+                    
+                    desc_el = await item.query_selector(selectors.get("desc", ""))
+                    description = await desc_el.inner_text() if desc_el else ""
+                    description = description.strip()
+
+                    fee_el = await item.query_selector(selectors.get("fee", ""))
+                    fee_text = await fee_el.inner_text() if fee_el else "Free"
+                    fee_text = fee_text.strip()
+
+                    entry_fees = []
+                    if fee_text.lower().startswith("free") or not fee_text:
+                        is_free = True
+                        price_indicator = 0
+                    else:
+                        is_free = False
+                        price_indicator = 1
+                        entry_fees.append({"name": "General", "amount": fee_text})
+                except Exception as e:
+                    print(f"Skipping card #{idx} due to parse error: {e}")
                     skipped_events += 1
                     continue
-                date_obj = parsed
 
-            else:
-                print(f"Unknown site type for {url}")
-                skipped_events += 1
-                continue
+                # --- Duplicate prevention ---
+                if event_url:
+                    # Ensure URL is absolute
+                    if event_url.startswith("/"):
+                        from urllib.parse import urljoin
+                        event_url = urljoin(url, event_url)
+                    
+                    existing = db.collection("YoVibe").document("data").collection("events") \
+                        .where("sourceUrl", "==", event_url).get()
+                    if existing:
+                        print(f"Skipped duplicate event: {event_name}")
+                        skipped_events += 1
+                        continue
 
-            poster_el = item.select_one(selectors["poster"])
-            poster = poster_el["src"] if poster_el else ""
-            desc_el = item.select_one(selectors.get("desc", ""))
-            description = desc_el.get_text(strip=True) if desc_el else ""
+                if not is_upcoming_event(date_obj):
+                    print(f"Skipped past event: {event_name} | Date: {date_obj}")
+                    skipped_events += 1
+                    continue
 
-            fee_el = item.select_one(selectors.get("fee", ""))
-            fee_text = fee_el.get_text(strip=True) if fee_el else "Free"
+                # Create or get venue
+                venue_id, is_new_venue = get_or_create_venue({
+                    "name": venue_name,
+                    "location": location,
+                    "description": f"Venue for {venue_name}",
+                    "backgroundImageUrl": poster,
+                    "latitude": None,
+                    "longitude": None
+                })
+                if is_new_venue:
+                    new_venues += 1
 
-            entry_fees = []
-            if fee_text.lower().startswith("free"):
-                is_free = True
-                price_indicator = 0
-            else:
-                is_free = False
-                price_indicator = 1
-                entry_fees.append({"name": "General", "amount": fee_text})
-        except Exception as e:
-            print(f"Skipping card #{idx} due to parse error: {e}")
-            skipped_events += 1
-            continue
+                event_doc = {
+                    "name": event_name,
+                    "date": date_obj,
+                    "time": date_obj.strftime("%H:%M"),
+                    "location": location,
+                    "posterImageUrl": poster,
+                    "artists": [],
+                    "venueId": venue_id,
+                    "venueName": venue_name,
+                    "description": description,
+                    "entryFees": entry_fees,
+                    "isFreeEntry": is_free,
+                    "priceIndicator": price_indicator,
+                    "sourceUrl": event_url,
+                    "createdAt": firestore.SERVER_TIMESTAMP,
+                    "isDeleted": False
+                }
+                db.collection("YoVibe").document("data").collection("events").add(event_doc)
+                print(f"Added event: {event_name} | Fee: {fee_text}")
+                added_events += 1
 
-        # --- Duplicate prevention ---
-        if event_url:
-            existing = db.collection("YoVibe").document("data").collection("events") \
-                .where("sourceUrl", "==", event_url).get()
-            if existing:
-                print(f"Skipped duplicate event: {event_name}")
-                skipped_events += 1
-                continue
+            await browser.close()
+            
+    except Exception as e:
+        print(f"Error scraping {url}: {e}")
+        scrape_summary[url] = {"added_events": 0, "skipped": 0, "new_venues": 0, "error": str(e)}
+        return
 
-        if not is_upcoming_event(date_obj):
-            print(f"Skipped past event: {event_name} | Date: {date_obj}")
-            skipped_events += 1
-            continue
-
-        # Create or get venue
-        venue_id = get_or_create_venue({
-            "name": venue_name,
-            "location": location,
-            "description": f"Venue for {venue_name}",
-            "backgroundImageUrl": poster,
-            "latitude": None,
-            "longitude": None
-        })
-
-        event_doc = {
-            "name": event_name,
-            "date": date_obj,
-            "time": date_obj.strftime("%H:%M"),
-            "location": location,
-            "posterImageUrl": poster,
-            "artists": [],
-            "venueId": venue_id,
-            "venueName": venue_name,
-            "description": description,
-            "entryFees": entry_fees,
-            "isFreeEntry": is_free,
-            "priceIndicator": price_indicator,
-            "sourceUrl": event_url,
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "isDeleted": False
-        }
-        db.collection("YoVibe").document("data").collection("events").add(event_doc)
-        print(f"Added event: {event_name} | Fee: {fee_text}")
-        added_events += 1
-
-    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "error": None}
-    print(f"Finished scrape for {url}: added={added_events}, skipped={skipped_events}")
+    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "new_venues": new_venues, "error": None}
+    print(f"Finished scrape for {url}: added={added_events}, skipped={skipped_events}, new_venues={new_venues}")
 
 
 def scrape_all_sites():
+    try:
+        asyncio.run(scrape_all_with_playwright())
+    except Exception as e:
+        print(f"Error running scraper: {e}")
+
+async def scrape_all_with_playwright():
     sites = [
         {
             "url": "https://allevents.ug/events/",
@@ -274,15 +306,16 @@ def scrape_all_sites():
     ]
 
     for site in sites:
-        scrape_site(site["url"], site["selectors"])
+        await scrape_site_with_playwright(site["url"], site["selectors"])
 
     try:
-        asyncio.run(scrape_quicket())
+        await scrape_quicket()
     except Exception as e:
         print(f"Error running Quicket scraper: {e}")
         scrape_summary["https://www.quicket.co.ug/events/uganda"] = {
             "added_events": 0,
             "skipped": 0,
+            "new_venues": 0,
             "error": str(e)
         }
 
@@ -291,6 +324,7 @@ async def scrape_quicket():
     print(f"\n--- Starting scrape for {url} ---")
     added_events = 0
     skipped_events = 0
+    new_venues = 0
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -381,7 +415,7 @@ async def scrape_quicket():
                     continue
 
                 # Create or get venue
-                venue_id = get_or_create_venue({
+                venue_id, is_new_venue = get_or_create_venue({
                     "name": venue_name,
                     "location": location,
                     "description": f"Venue for {venue_name}",
@@ -389,6 +423,8 @@ async def scrape_quicket():
                     "latitude": None,
                     "longitude": None
                 })
+                if is_new_venue:
+                    new_venues += 1
 
                 event_doc = {
                     "name": event_name,
@@ -414,11 +450,11 @@ async def scrape_quicket():
             await browser.close()
     except Exception as e:
         print(f"Error scraping Quicket: {e}")
-        scrape_summary[url] = {"added_events": 0, "skipped": 0, "error": str(e)}
+        scrape_summary[url] = {"added_events": 0, "skipped": 0, "new_venues": 0, "error": str(e)}
         return
 
-    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "error": None}
-    print(f"Finished scrape for Quicket: added={added_events}, skipped={skipped_events}")
+    scrape_summary[url] = {"added_events": added_events, "skipped": skipped_events, "new_venues": new_venues, "error": None}
+    print(f"Finished scrape for Quicket: added={added_events}, skipped={skipped_events}, new_venues={new_venues}")
 
 if __name__=="__main__":
     scrape_all_sites()
@@ -427,5 +463,6 @@ if __name__=="__main__":
         print(f"Site: {site}")
         print(f"  Added events: {stats['added_events']}")
         print(f"  Skipped events: {stats['skipped']}")
+        print(f"  New venues: {stats['new_venues']}")
         if stats['error']:
             print(f"  Error: {stats['error']}")
